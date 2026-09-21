@@ -1,5 +1,8 @@
 # btrfs-peek
 
+[![CI](https://github.com/noahsabaj/btrfs-peek/actions/workflows/ci.yml/badge.svg)](https://github.com/noahsabaj/btrfs-peek/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
 Read a btrfs filesystem from userspace. Read-only, on any OS, with no driver and no mount.
 
 Built for the dual-boot problem: your work is on the Linux partition, you are booted into
