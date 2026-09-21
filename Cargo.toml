@@ -1,0 +1,30 @@
+[package]
+name = "btrfs-peek"
+version = "0.1.0"
+edition = "2021"
+description = "Read a btrfs filesystem from userspace, read-only, on any OS. No driver, no mount. Built for dual-booters and for agents."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/noahsabaj/btrfs-peek"
+homepage = "https://github.com/noahsabaj/btrfs-peek"
+authors = ["Noah Sabaj"]
+exclude = ["tests/*.img"]
+keywords = ["btrfs", "filesystem", "dual-boot", "windows", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+crc32c = "0.6"
+filetime = "0.2"
+flate2 = "1"
+globset = "0.4"
+lzokay-native = "0.1"
+ruzstd = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

@@ -1,0 +1,5 @@
+# Keep everything LF in the repository. tests/mkimg.sh is run by bash in CI,
+# where a CRLF shebang line fails with a confusing "no such file" error.
+* text=auto eol=lf
+*.png binary
+*.img binary
