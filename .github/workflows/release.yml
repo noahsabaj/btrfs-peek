@@ -33,7 +33,7 @@ jobs:
       # runs can end up signed.
       - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
       - run: cargo build --release --locked
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: btrfs-peek-windows
           path: target/release/btrfs-peek.exe
@@ -50,7 +50,7 @@ jobs:
     steps:
       # For update-key.pub, which the signature is checked against.
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: btrfs-peek-windows
           path: dist
