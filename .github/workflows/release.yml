@@ -1,0 +1,93 @@
+name: Release
+
+# A pushed tag vX.Y.Z (matching Cargo.toml) builds the Windows exe, signs it
+# with the release key, and publishes both as a GitHub release. The helper
+# service updates itself only to builds signed here: the secret key lives in
+# this repository's secrets and nowhere else.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: The tag must match Cargo.toml's version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "the tag $GITHUB_REF_NAME does not match Cargo.toml's version $version"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-peek-windows
+          path: target/release/btrfs-peek.exe
+          if-no-files-found: error
+
+  publish:
+    name: sign and publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      ASSET: btrfs-peek-windows-x86_64.exe
+    steps:
+      # For update-key.pub, which the signature is checked against.
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: btrfs-peek-windows
+          path: dist
+      - name: Name the asset
+        run: mv dist/btrfs-peek.exe "dist/$ASSET"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install rsign2 --locked --version 0.6.7
+
+      - name: Sign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          key="$RUNNER_TEMP/minisign.key"
+          trap 'rm -f "$key"' EXIT
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "the secret MINISIGN_SECRET_KEY is not set"
+            exit 1
+          fi
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          # -W: the key has no password; without it rsign waits for one.
+          rsign sign -W -s "$key" \
+            -t "btrfs-peek ${GITHUB_REF_NAME#v} windows-x86_64" \
+            -x "dist/$ASSET.minisig" "dist/$ASSET"
+
+      # What the service will check, checked before anything is published.
+      - name: Verify against update-key.pub
+        run: |
+          rsign verify -p update-key.pub -x "dist/$ASSET.minisig" "dist/$ASSET"
+          grep -Fx "trusted comment: btrfs-peek ${GITHUB_REF_NAME#v} windows-x86_64" "dist/$ASSET.minisig"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dist/$ASSET" "dist/$ASSET.minisig" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "btrfs-peek ${GITHUB_REF_NAME#v} for Windows (x86_64), signed with the release key in update-key.pub. Installed helpers update themselves to it within a day, or now with \`btrfs-peek helper update\`."
+
+      - name: Delete the key file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/minisign.key"
