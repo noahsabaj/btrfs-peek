@@ -136,7 +136,8 @@ pub fn open_partition(path: &str) -> Result<File, Refusal> {
         io::ErrorKind::NotFound => Refusal::NotFound(format!("{path}: no such partition")),
         _ => Refusal::Failed(format!("{path}: {e}")),
     })?;
-    let mut sb = vec![0u8; SUPER_SIZE];
+    let mut space = Vec::new();
+    let sb = aligned(&mut space, SUPER_SIZE);
     let mut done = 0;
     while done < sb.len() {
         match crate::dev::read_at(&file, &mut sb[done..], SUPER_OFFSET + done as u64) {
@@ -146,10 +147,22 @@ pub fn open_partition(path: &str) -> Result<File, Refusal> {
             Err(e) => return Err(Refusal::Failed(format!("{path}: {e}"))),
         }
     }
-    if done < sb.len() || Superblock::parse(&sb).is_err() {
+    if done < sb.len() || Superblock::parse(sb).is_err() {
         return Err(Refusal::Refused(format!("{path}: not a btrfs partition")));
     }
     Ok(file)
+}
+
+/// Page alignment satisfies every device's buffer rule.
+const BUFFER_ALIGN: usize = 4096;
+
+/// A `len`-byte buffer inside `space` starting on a page boundary. Raw devices
+/// refuse a misaligned buffer (os error 87), and an allocation is only
+/// guaranteed byte alignment.
+fn aligned(space: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    space.resize(len + BUFFER_ALIGN, 0);
+    let start = space.as_ptr().align_offset(BUFFER_ALIGN);
+    &mut space[start..start + len]
 }
 
 fn respond(s: &mut impl Write, status: u8, payload: &[u8]) -> io::Result<()> {
@@ -199,6 +212,7 @@ pub fn serve_client<S: Read + Write>(
     }
     respond(&mut s, OK, VERSION.as_bytes())?;
     let mut file: Option<File> = None;
+    let mut space = Vec::new();
     while let Some(op) = read_byte(&mut s)? {
         match op {
             OPEN => {
@@ -241,10 +255,8 @@ pub fn serve_client<S: Read + Write>(
                     respond(&mut s, ERROR, b"READ before OPEN")?;
                     continue;
                 };
-                // A buffer of its own, not the reply's tail after its 5-byte
-                // header: raw devices refuse a misaligned buffer (os error 87).
-                let mut data = vec![0u8; len];
-                match crate::dev::read_at(f, &mut data, off) {
+                let data = aligned(&mut space, len);
+                match crate::dev::read_at(f, data, off) {
                     Ok(n) => {
                         let mut head = [OK, 0, 0, 0, 0];
                         head[1..].copy_from_slice(&(n as u32).to_le_bytes());
