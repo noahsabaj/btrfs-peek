@@ -1,6 +1,6 @@
 //! The filesystem proper: chunk mapping, tree walks, lookups, and file reads.
 
-use crate::decompress::decompress;
+use crate::decompress::{decompress, decompress_inline};
 use crate::dev::Device;
 use crate::disk::*;
 use anyhow::{anyhow, bail, Context, Result};
@@ -622,7 +622,7 @@ impl Fs {
                     let plain = if ext.compression == 0 {
                         raw.clone()
                     } else {
-                        decompress(
+                        decompress_inline(
                             ext.compression,
                             raw,
                             ext.ram_bytes as usize,

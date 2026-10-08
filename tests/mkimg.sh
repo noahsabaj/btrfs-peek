@@ -62,6 +62,10 @@ for alg in zlib lzo zstd; do
   mkdir "c_$alg"
   gen > "c_$alg/big.txt"
   for i in $(seq 1 200); do echo "tiny compressible aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; done > "c_$alg/small_inline.txt"
+  # truly inline (under a sector) and compressed: the kernel may compress the
+  # whole sector and declare only the file's bytes
+  for i in $(seq 1 20); do echo "inline compressible bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; done > "c_$alg/inline.txt"
+  printf 'export { x as default };\n' > "c_$alg/inline_tiny.js"
   # mixed: compressible text + random tail, and a partial overwrite to create offset extents
   { gen; head -c 300000 /dev/urandom; gen; } > "c_$alg/mixed.bin"
   sync

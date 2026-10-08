@@ -1,6 +1,6 @@
 [package]
 name = "btrfs-peek"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Read a btrfs filesystem from userspace, read-only, on any OS. No driver, no mount. Built for dual-booters and for agents."
 license = "MIT OR Apache-2.0"

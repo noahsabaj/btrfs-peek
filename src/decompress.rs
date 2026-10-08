@@ -1,7 +1,8 @@
 //! The three btrfs compression formats.
 //!
-//! A compressed extent decodes to exactly `ram_bytes`. Anything else means the
-//! extent is corrupt, and this module reports that rather than papering over it:
+//! A compressed extent decodes to exactly `ram_bytes`, give or take sector
+//! padding (`finish`). Anything else means the extent is corrupt, and this
+//! module reports that rather than papering over it:
 //! returning a plausible-looking buffer of zeros is worse than failing, because
 //! the caller would write it to disk and call the copy a success.
 
@@ -13,25 +14,53 @@ use std::io::Read;
 pub const MAX_RAM_BYTES: usize = 1 << 30;
 
 pub fn decompress(algo: u8, src: &[u8], ram_bytes: usize, sectorsize: usize) -> Result<Vec<u8>> {
+    decode(algo, src, ram_bytes, sectorsize, false)
+}
+
+/// An inline extent: the kernel may compress the file's whole last sector,
+/// the zeros past its end included, while `ram_bytes` declares only the
+/// file's bytes. It reads one sector back and keeps `ram_bytes` of it, so a
+/// stream may decode up to the sector boundary; the rest is dropped. (Most
+/// small files on a Fedora install with `compress=zstd:1`, 2026, decode to
+/// a whole 4096-byte sector this way.)
+pub fn decompress_inline(
+    algo: u8,
+    src: &[u8],
+    ram_bytes: usize,
+    sectorsize: usize,
+) -> Result<Vec<u8>> {
+    decode(algo, src, ram_bytes, sectorsize, true)
+}
+
+fn decode(
+    algo: u8,
+    src: &[u8],
+    ram_bytes: usize,
+    sectorsize: usize,
+    inline: bool,
+) -> Result<Vec<u8>> {
     if ram_bytes > MAX_RAM_BYTES {
         bail!("extent claims {ram_bytes} bytes decompressed, which no btrfs extent can be");
     }
     if sectorsize == 0 {
         bail!("sectorsize is zero");
     }
+    let size = Size {
+        ram_bytes,
+        most: if inline {
+            ram_bytes.next_multiple_of(sectorsize)
+        } else {
+            ram_bytes
+        },
+        sectorsize,
+    };
     let out = match algo {
-        1 => stream(
-            flate2::read::ZlibDecoder::new(src),
-            src,
-            ram_bytes,
-            sectorsize,
-            "zlib",
-        )?,
-        2 => lzo(src, ram_bytes, sectorsize)?,
+        1 => stream(flate2::read::ZlibDecoder::new(src), src, size, "zlib")?,
+        2 => lzo(src, size)?,
         3 => {
             let dec = ruzstd::decoding::StreamingDecoder::new(src)
                 .map_err(|e| anyhow::anyhow!("zstd extent: {e}"))?;
-            stream(dec, src, ram_bytes, sectorsize, "zstd")?
+            stream(dec, src, size, "zstd")?
         }
         n => bail!("unknown compression type {n}"),
     };
@@ -39,21 +68,26 @@ pub fn decompress(algo: u8, src: &[u8], ram_bytes: usize, sectorsize: usize) -> 
     Ok(out)
 }
 
-fn stream(
-    reader: impl Read,
-    src: &[u8],
+/// What an extent may decode to.
+#[derive(Clone, Copy)]
+struct Size {
+    /// What it declares.
     ram_bytes: usize,
+    /// The most it may decode to: `ram_bytes`, or for an inline extent the
+    /// end of its sector (`decompress_inline`).
+    most: usize,
     sectorsize: usize,
-    what: &str,
-) -> Result<Vec<u8>> {
+}
+
+fn stream(reader: impl Read, src: &[u8], size: Size, what: &str) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    // Read one byte past what we want: if it arrives, the extent decodes to more
-    // than it declared, so the data does not match the metadata describing it.
+    // Read one byte past what it may decode to: if it arrives, the data does
+    // not match the metadata describing it.
     reader
-        .take(ram_bytes as u64 + 1)
+        .take(size.most as u64 + 1)
         .read_to_end(&mut out)
         .with_context(|| format!("{what} extent ({} compressed bytes)", src.len()))?;
-    finish(out, ram_bytes, sectorsize, what)
+    finish(out, size, what)
 }
 
 /// Settles up between what the stream produced and what the extent declared.
@@ -64,12 +98,26 @@ fn stream(
 /// truncated or corrupt extent, and must not be quietly filled in: a buffer of
 /// zeros that looks like data is worse than an error, because the caller would
 /// write it out and report the copy a success.
-fn finish(mut out: Vec<u8>, ram_bytes: usize, sectorsize: usize, what: &str) -> Result<Vec<u8>> {
-    if out.len() > ram_bytes {
+///
+/// An inline extent may also decode past `ram_bytes` up to its sector's end
+/// (`decompress_inline`); those bytes are not the file's and are dropped.
+fn finish(mut out: Vec<u8>, size: Size, what: &str) -> Result<Vec<u8>> {
+    let Size {
+        ram_bytes,
+        most,
+        sectorsize,
+    } = size;
+    if out.len() > most {
+        let past = if most > ram_bytes {
+            format!(", past the end of its {sectorsize}-byte sector")
+        } else {
+            String::new()
+        };
         bail!(
-            "{what} extent decodes to more than the {ram_bytes} bytes it declares; it is corrupt"
+            "{what} extent decodes to more than the {ram_bytes} bytes it declares{past}; it is corrupt"
         );
     }
+    out.truncate(ram_bytes);
     let short_by = ram_bytes - out.len();
     if short_by >= sectorsize {
         bail!(
@@ -85,7 +133,12 @@ fn finish(mut out: Vec<u8>, ram_bytes: usize, sectorsize: usize, what: &str) -> 
 /// btrfs frames LZO1X itself: a 4-byte total length, then segments of
 /// `[4-byte length][data]`, each holding one sector of plaintext. A segment
 /// header never straddles a sector boundary; the writer pads to the next one.
-fn lzo(src: &[u8], ram_bytes: usize, sectorsize: usize) -> Result<Vec<u8>> {
+fn lzo(src: &[u8], size: Size) -> Result<Vec<u8>> {
+    let Size {
+        ram_bytes,
+        sectorsize,
+        ..
+    } = size;
     let le32 = |off: usize| -> Result<usize> {
         match src.get(off..off + 4) {
             Some(b) => Ok(u32::from_le_bytes(b.try_into().unwrap()) as usize),
@@ -133,7 +186,7 @@ fn lzo(src: &[u8], ram_bytes: usize, sectorsize: usize) -> Result<Vec<u8>> {
         out.extend_from_slice(&plain);
         pos += seg_len;
     }
-    finish(out, ram_bytes, sectorsize, "lzo")
+    finish(out, size, "lzo")
 }
 
 #[cfg(test)]
@@ -172,6 +225,45 @@ mod tests {
         let err = decompress(1, &comp, plain.len() + 4096, 4096).unwrap_err();
         assert!(
             format!("{err:#}").contains("truncated or corrupt"),
+            "got: {err:#}"
+        );
+    }
+
+    /// What the kernel wrote for most small files on a Fedora install: the
+    /// file's last sector compressed whole, zeros past its end included.
+    fn sector_of(data: &[u8]) -> Vec<u8> {
+        let mut sector = data.to_vec();
+        sector.resize(4096, 0);
+        zlib_of(&sector)
+    }
+
+    #[test]
+    fn an_inline_extent_that_decodes_to_its_whole_sector_keeps_its_declared_bytes() {
+        for plain in [b"abcd".to_vec(), b"export default 1;\n".repeat(50)] {
+            let got = decompress_inline(1, &sector_of(&plain), plain.len(), 4096).unwrap();
+            assert_eq!(got, plain);
+        }
+        // And one that decodes to exactly what it declares, as before.
+        let plain = b"the quick brown fox".repeat(10);
+        let got = decompress_inline(1, &zlib_of(&plain), plain.len(), 4096).unwrap();
+        assert_eq!(got, plain);
+    }
+
+    #[test]
+    fn an_inline_extent_that_decodes_past_its_sector_is_an_error() {
+        let plain = b"x".repeat(4097);
+        let err = decompress_inline(1, &zlib_of(&plain), 100, 4096).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("past the end of its 4096-byte sector"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn a_regular_extent_that_decodes_to_more_than_it_declares_is_an_error() {
+        let err = decompress(1, &sector_of(b"abcd"), 4, 4096).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("more than the 4 bytes it declares; it is corrupt"),
             "got: {err:#}"
         );
     }
