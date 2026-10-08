@@ -241,14 +241,15 @@ pub fn serve_client<S: Read + Write>(
                     respond(&mut s, ERROR, b"READ before OPEN")?;
                     continue;
                 };
-                // Read straight into the reply, after room for its header.
-                let mut msg = vec![0u8; 5 + len];
-                match crate::dev::read_at(f, &mut msg[5..], off) {
+                // A buffer of its own, not the reply's tail after its 5-byte
+                // header: raw devices refuse a misaligned buffer (os error 87).
+                let mut data = vec![0u8; len];
+                match crate::dev::read_at(f, &mut data, off) {
                     Ok(n) => {
-                        msg[0] = OK;
-                        msg[1..5].copy_from_slice(&(n as u32).to_le_bytes());
-                        msg.truncate(5 + n);
-                        s.write_all(&msg)?;
+                        let mut head = [OK, 0, 0, 0, 0];
+                        head[1..].copy_from_slice(&(n as u32).to_le_bytes());
+                        s.write_all(&head)?;
+                        s.write_all(&data[..n])?;
                     }
                     Err(e) => respond(&mut s, ERROR, e.to_string().as_bytes())?,
                 }
@@ -496,6 +497,36 @@ mod tests {
     fn protocol_round_trip_over_tcp() {
         let addr = tcp_server();
         exercise(|| TcpStream::connect(addr).unwrap(), "tcp");
+    }
+
+    /// Like a raw device, an unbuffered file refuses a misaligned buffer, so
+    /// this fails if the server reads into anything but an aligned buffer.
+    #[cfg(windows)]
+    #[test]
+    fn reads_work_on_a_device_that_wants_aligned_buffers() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+        let data: Vec<u8> = (0..16_384u32).map(|i| (i * 13 % 251) as u8).collect();
+        let file = temp("unbuffered", &data);
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            serve_client(s, |p: &str| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(FILE_FLAG_NO_BUFFERING)
+                    .open(p)
+                    .map_err(|e| Refusal::Failed(e.to_string()))
+            })
+        });
+        let (mut s, _) = Session::start(TcpStream::connect(addr).unwrap()).unwrap();
+        s.open(file.to_str().unwrap()).unwrap();
+        let mut buf = vec![0u8; 4096];
+        assert_eq!(s.read_at(&mut buf, 4096).unwrap(), 4096);
+        assert_eq!(buf, data[4096..8192]);
+        drop(s);
+        std::fs::remove_file(&file).unwrap();
     }
 
     #[test]
