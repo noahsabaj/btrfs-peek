@@ -43,8 +43,9 @@ exit code `4` in an ordinary terminal. The helper is a small Windows service
 that reads btrfs partitions for you. Install it once, from an elevated terminal:
 
 ```
-btrfs-peek helper install          # elevated, once; run it again to update
+btrfs-peek helper install          # elevated, once
 btrfs-peek helper status           # any terminal: exit 0 if it is installed and answering
+btrfs-peek helper update           # any terminal: update the service to the latest signed release now
 btrfs-peek helper uninstall        # elevated
 ```
 
@@ -64,6 +65,33 @@ What the helper can and cannot do:
   privileges beyond the ones every process has.
 - btrfs-peek checks that the pipe is served by the installed service (by its
   process id) before trusting it.
+
+### Updates
+
+The service updates itself, so a fix to it never needs another elevated
+install. Ten minutes after it starts and then daily (or at once with
+`btrfs-peek helper update`, from any terminal), it fetches the latest
+[release](https://github.com/noahsabaj/btrfs-peek/releases) with Windows' own
+`curl.exe` and installs it only if all of these hold:
+
+- its minisign signature verifies against the release key built into the
+  service ([update-key.pub](update-key.pub));
+- the signature's trusted comment is exactly `btrfs-peek X.Y.Z windows-x86_64`,
+  so a build for another target is refused;
+- X.Y.Z is newer than the running version, so neither the same build nor an
+  older signed one (with a bug since fixed) is taken.
+
+Releases are built and signed in GitHub Actions; the secret key lives in the
+repository's secrets and never touches this machine, so nothing running here
+can make the service run its code. It swaps the new exe in, waits until no
+client is reading through it, and exits so that the service manager starts it
+again on the new build. Each check's time, outcome and error are written to
+`C:\Program Files\btrfs-peek\update-status.txt`, which `helper status` shows.
+
+A local build (`cargo install`, `cargo build`) updates the btrfs-peek you run
+freely, but the service moves only through signed releases. Helpers installed
+before 0.3.0 cannot update themselves: run `btrfs-peek helper install` from an
+elevated terminal once more.
 
 On Linux, the `disk` group does the same job: `sudo usermod -aG disk $USER`,
 then log in again.
@@ -89,7 +117,7 @@ which the tool cannot know.
 | `cat PATH [--offset N --length N]` | File contents to stdout. |
 | `find PATH [--name GLOB] [-t f\|d\|l] [--max-depth N] [-x] [--no-snapshots]` | Search by name. |
 | `cp SRC DEST [-e GLOB]... [--force] [-x] [--no-snapshots] [--manifest FILE]` | Copy a file or tree out. |
-| `helper install [--sid SID]` / `uninstall` / `status` | Windows: read without an elevated terminal (above). |
+| `helper install [--sid SID]` / `uninstall` / `status` / `update` | Windows: read without an elevated terminal (above). |
 
 `cp` keeps sparse files sparse, sets mtimes, and keeps going past an unreadable file
 (reported as a warning). What the host cannot represent is handled rather than dropped:
@@ -146,6 +174,13 @@ sudo bash tests/mkimg.sh /some/dir
 btrfs-peek -d /some/dir/test.img cp / out --manifest peek.jsonl
 python tests/verify.py /some/dir/manifest.txt peek.jsonl /
 ```
+
+## Releases
+
+Push a tag `vX.Y.Z` matching the version in Cargo.toml: `.github/workflows/release.yml`
+builds the Windows exe, signs it with the release key, checks the signature against
+`update-key.pub`, and publishes both as a GitHub release, which installed helpers then
+update to.
 
 ## Contributing
 
