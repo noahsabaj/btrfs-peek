@@ -5,6 +5,7 @@ mod decompress;
 mod dev;
 mod disk;
 mod fs;
+mod helper;
 mod scan;
 
 use anyhow::{bail, Context, Result};
@@ -21,6 +22,11 @@ as directories, so a distro that mounts `@home` at /home keeps its files under
 
 EXIT CODES: 0 ok, 1 error, 2 usage, 3 path not found, 4 device access denied,
 5 copy finished but some entries failed (see the warnings).
+
+RAW DISKS need privileges. On Windows, run from an elevated (Administrator)
+terminal, or run `btrfs-peek helper install` from one, once: a small service
+then lets your account read btrfs partitions from any terminal. On Linux, run
+as root or join the `disk` group.
 
 The device is only ever opened for reading. Nothing is mounted, no driver is
 installed, and no code path writes to it.";
@@ -40,7 +46,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Find btrfs filesystems on this machine's disks (needs admin/root).
+    /// Find btrfs filesystems on this machine's disks (needs admin/root, or the helper on Windows).
     Scan,
     /// Filesystem summary: label, uuid, size, features, profiles.
     Info,
@@ -103,17 +109,24 @@ enum Cmd {
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
+    /// Let your account read btrfs partitions without an elevated terminal (Windows).
+    Helper {
+        #[command(subcommand)]
+        action: helper::Action,
+    },
 }
+
+/// What to do when raw disks are denied.
+const PRIVILEGE_HINT: &str = if cfg!(windows) {
+    "run from an elevated (Administrator) terminal, or install the helper once from one: `btrfs-peek helper install`"
+} else {
+    "run as root, or add yourself to the `disk` group"
+};
 
 pub fn open_error(path: &str, e: std::io::Error) -> anyhow::Error {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
-        let how = if cfg!(windows) {
-            "run from an elevated (Administrator) terminal"
-        } else {
-            "run as root, or add yourself to the `disk` group"
-        };
         return anyhow::Error::new(AccessDenied).context(format!(
-            "{path}: access denied; raw disks need privileges: {how}"
+            "{path}: access denied; raw disks need privileges: {PRIVILEGE_HINT}"
         ));
     }
     anyhow::Error::new(e).context(format!("opening {path}"))
@@ -308,6 +321,9 @@ struct FindQuery {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    if let Cmd::Helper { action } = &cli.cmd {
+        return helper::run(action, cli.json);
+    }
     if let Cmd::Scan = cli.cmd {
         let r = scan::scan();
         if cli.json {
@@ -324,7 +340,15 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         if !r.access_denied.is_empty() {
-            eprintln!("btrfs-peek: {} devices could not be opened; rerun with admin/root privileges to scan them", r.access_denied.len());
+            let how = if cfg!(windows) {
+                PRIVILEGE_HINT
+            } else {
+                "rerun with admin/root privileges"
+            };
+            eprintln!(
+                "btrfs-peek: {} devices could not be opened; to scan them, {how}",
+                r.access_denied.len()
+            );
             if r.filesystems.is_empty() {
                 return Err(anyhow::Error::new(AccessDenied));
             }
@@ -343,7 +367,7 @@ fn run(cli: Cli) -> Result<()> {
         eprintln!("btrfs-peek: warning: the filesystem was not cleanly unmounted; writes fsynced just before the crash are not visible");
     }
     match cli.cmd {
-        Cmd::Scan => unreachable!(),
+        Cmd::Scan | Cmd::Helper { .. } => unreachable!(),
         Cmd::Info => {
             let sb = &fs.sb;
             let features: Vec<_> = disk::INCOMPAT_FLAGS

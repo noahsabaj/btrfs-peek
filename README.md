@@ -14,7 +14,8 @@ It is also built to be driven by agents: every command has `--json`, errors go t
 exit codes are distinct, and nothing is interactive.
 
 ```
-btrfs-peek scan                                   # find btrfs partitions (admin/root)
+btrfs-peek helper install                         # Windows, elevated, once: then no admin needed
+btrfs-peek scan                                   # find btrfs partitions
 btrfs-peek -d \\.\Harddisk0Partition6 info
 btrfs-peek -d \\.\Harddisk0Partition6 subvols
 btrfs-peek -d \\.\Harddisk0Partition6 ls -l /@home/me
@@ -33,7 +34,39 @@ cargo install --git https://github.com/noahsabaj/btrfs-peek
 
 Pure Rust, no C toolchain needed, and it builds on Windows, Linux and macOS.
 Raw disks need privileges: an elevated (Administrator) terminal on Windows,
-root on Linux.
+root on Linux. On Windows the helper (below) asks for that once instead of every time.
+
+## Without an elevated terminal (Windows)
+
+Windows lets only administrators open a raw disk, so every command fails with
+exit code `4` in an ordinary terminal. The helper is a small Windows service
+that reads btrfs partitions for you. Install it once, from an elevated terminal:
+
+```
+btrfs-peek helper install          # elevated, once; run it again to update
+btrfs-peek helper status           # any terminal: exit 0 if it is installed and answering
+btrfs-peek helper uninstall        # elevated
+```
+
+After that, every command works unchanged from any terminal of the account
+that installed it. When opening a disk is denied, btrfs-peek asks the helper
+instead.
+
+What the helper can and cannot do:
+
+- It opens only btrfs partitions (`\\.\HarddiskNPartitionM`, checked for a btrfs
+  superblock). Whole disks, other filesystems, files and other paths are refused.
+- It only reads. It opens the partition for reading, as btrfs-peek itself does.
+- It answers only the account that installed it (or the one named with `--sid`),
+  and only on this machine: its named pipe refuses network clients.
+- It runs the copy installed in `C:\Program Files\btrfs-peek`, which only
+  administrators can change, never the exe you installed it from. It keeps no
+  privileges beyond the ones every process has.
+- btrfs-peek checks that the pipe is served by the installed service (by its
+  process id) before trusting it.
+
+On Linux, the `disk` group does the same job: `sudo usermod -aG disk $USER`,
+then log in again.
 
 ## Paths and subvolumes
 
@@ -56,6 +89,7 @@ which the tool cannot know.
 | `cat PATH [--offset N --length N]` | File contents to stdout. |
 | `find PATH [--name GLOB] [-t f\|d\|l] [--max-depth N] [-x] [--no-snapshots]` | Search by name. |
 | `cp SRC DEST [-e GLOB]... [--force] [-x] [--no-snapshots] [--manifest FILE]` | Copy a file or tree out. |
+| `helper install [--sid SID]` / `uninstall` / `status` | Windows: read without an elevated terminal (above). |
 
 `cp` keeps sparse files sparse, sets mtimes, and keeps going past an unreadable file
 (reported as a warning). What the host cannot represent is handled rather than dropped:
