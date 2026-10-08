@@ -29,7 +29,9 @@ jobs:
             echo "the tag $GITHUB_REF_NAME does not match Cargo.toml's version $version"
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@stable
+      # The runner's own rustup, not a third-party action: what this workflow
+      # runs can end up signed.
+      - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
       - run: cargo build --release --locked
       - uses: actions/upload-artifact@v4
         with:
@@ -54,7 +56,7 @@ jobs:
           path: dist
       - name: Name the asset
         run: mv dist/btrfs-peek.exe "dist/$ASSET"
-      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
       - run: cargo install rsign2 --locked --version 0.6.7
 
       - name: Sign
