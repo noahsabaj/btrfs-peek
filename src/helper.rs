@@ -8,7 +8,8 @@
 //! writing.
 //!
 //! The wire protocol lives here, generic over `Read + Write`, so it is tested
-//! on every OS. The service, the pipe and the install live in `windows.rs`.
+//! on every OS, as is what the service accepts as an update of itself
+//! (`update.rs`). The service, the pipe and the install live in `windows.rs`.
 
 // On other OSes only the tests use the protocol; the service is Windows-only.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -17,16 +18,21 @@ use crate::disk::{Superblock, SUPER_OFFSET, SUPER_SIZE};
 use std::fs::File;
 use std::io::{self, Read, Write};
 
+mod update;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use windows::Remote;
+
+pub use update::{Update, Version};
 
 pub const PROTOCOL: u8 = 1;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const OPEN: u8 = 1;
 const READ: u8 = 2;
+/// Added after protocol 1 shipped; older services answer "unknown operation 3".
+const UPDATE: u8 = 3;
 
 const OK: u8 = 0;
 const NOT_FOUND: u8 = 1;
@@ -52,6 +58,8 @@ pub enum Action {
     Uninstall,
     /// Exit 0 if the helper is installed and answering, else 1.
     Status,
+    /// Have the service update itself to the latest signed release now (any terminal).
+    Update,
     /// What the Windows service manager runs.
     #[command(hide = true)]
     Serve {
@@ -198,17 +206,29 @@ fn read_u64(s: &mut impl Read) -> io::Result<u64> {
     Ok(u64::from_le_bytes(b))
 }
 
-/// Serves one client until it hangs up. `open` decides what may be opened.
+/// How a client's session ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ended {
+    Closed,
+    /// An UPDATE installed a new build and the session was closed after the
+    /// reply, so it does not hold up the restart onto it.
+    Updated,
+}
+
+/// Serves one client until it hangs up. `open` decides what may be opened;
+/// `update` is what an UPDATE runs.
 pub fn serve_client<S: Read + Write>(
     mut s: S,
     open: impl Fn(&str) -> Result<File, Refusal>,
-) -> io::Result<()> {
+    update: impl Fn() -> io::Result<Update>,
+) -> io::Result<Ended> {
+    let closed = |r: io::Result<()>| r.map(|()| Ended::Closed);
     let Some(proto) = read_byte(&mut s)? else {
-        return Ok(());
+        return Ok(Ended::Closed);
     };
     if proto != PROTOCOL {
         let msg = format!("this helper speaks protocol {PROTOCOL}, the client {proto}: install the helper again with the same btrfs-peek");
-        return respond(&mut s, ERROR, msg.as_bytes());
+        return closed(respond(&mut s, ERROR, msg.as_bytes()));
     }
     respond(&mut s, OK, VERSION.as_bytes())?;
     let mut file: Option<File> = None;
@@ -219,7 +239,7 @@ pub fn serve_client<S: Read + Write>(
                 let len = read_u32(&mut s)? as usize;
                 if len > MAX_PATH {
                     let msg = format!("path longer than {MAX_PATH} bytes");
-                    return respond(&mut s, ERROR, msg.as_bytes());
+                    return closed(respond(&mut s, ERROR, msg.as_bytes()));
                 }
                 let mut path = vec![0u8; len];
                 s.read_exact(&mut path)?;
@@ -266,13 +286,22 @@ pub fn serve_client<S: Read + Write>(
                     Err(e) => respond(&mut s, ERROR, e.to_string().as_bytes())?,
                 }
             }
+            UPDATE => match update() {
+                Ok(u) => {
+                    respond(&mut s, OK, u.to_string().as_bytes())?;
+                    if let Update::Installed(_) = u {
+                        return Ok(Ended::Updated);
+                    }
+                }
+                Err(e) => respond(&mut s, ERROR, e.to_string().as_bytes())?,
+            },
             other => {
                 let msg = format!("unknown operation {other}");
-                return respond(&mut s, ERROR, msg.as_bytes());
+                return closed(respond(&mut s, ERROR, msg.as_bytes()));
             }
         }
     }
-    Ok(())
+    Ok(Ended::Closed)
 }
 
 fn status_error(status: u8, msg: String) -> io::Error {
@@ -337,6 +366,24 @@ impl<S: Read + Write> Session<S> {
         }
         self.s.read_exact(&mut buf[..n])?;
         Ok(n)
+    }
+
+    /// Asks the service to update itself to the latest signed release; its
+    /// reply, and the version it installed if it did. `version` is the one
+    /// the handshake returned, for the error an older service gives.
+    pub fn update(&mut self, version: &str) -> io::Result<(String, Option<Version>)> {
+        self.s.write_all(&[UPDATE])?;
+        let reply = match self.reply() {
+            Ok(r) => String::from_utf8_lossy(&r).into_owned(),
+            Err(e) if e.to_string() == format!("unknown operation {UPDATE}") => {
+                return Err(io::Error::other(format!(
+                    "this helper ({version}) predates self-update; run `btrfs-peek helper install` from an elevated terminal once more"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+        let installed = update::installed_version(&reply);
+        Ok((reply, installed))
     }
 
     fn header(&mut self) -> io::Result<(u8, usize)> {
@@ -438,17 +485,34 @@ mod tests {
         })
     }
 
-    /// One server thread per connection, like the service.
-    fn tcp_server() -> std::net::SocketAddr {
+    /// A service that is always up to date.
+    pub(super) fn test_update() -> io::Result<Update> {
+        Ok(Update::UpToDate(Version::running()))
+    }
+
+    /// One server thread per connection, like the service; `update` is what
+    /// an UPDATE gets.
+    fn tcp_server_with(
+        update: fn() -> io::Result<Update>,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<Ended>) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for s in l.incoming() {
-                let s = s.unwrap();
-                std::thread::spawn(move || serve_client(s, test_open));
+                let (s, tx) = (s.unwrap(), tx.clone());
+                std::thread::spawn(move || {
+                    if let Ok(ended) = serve_client(s, test_open, update) {
+                        let _ = tx.send(ended);
+                    }
+                });
             }
         });
-        addr
+        (addr, rx)
+    }
+
+    fn tcp_server() -> std::net::SocketAddr {
+        tcp_server_with(test_update).0
     }
 
     /// The whole client-visible protocol, over any connector.
@@ -479,6 +543,12 @@ mod tests {
         // One OPEN per connection; the session goes on.
         let e = s.open(path).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::Other);
+        assert_eq!(s.read_at(&mut buf, 0).unwrap(), 100);
+
+        // An UPDATE with nothing newer leaves the session going.
+        let (reply, installed) = s.update(&version).unwrap();
+        assert_eq!(reply, format!("up to date ({VERSION})"));
+        assert_eq!(installed, None);
         assert_eq!(s.read_at(&mut buf, 0).unwrap(), 100);
         drop(s);
 
@@ -524,13 +594,14 @@ mod tests {
         let addr = l.local_addr().unwrap();
         std::thread::spawn(move || {
             let (s, _) = l.accept().unwrap();
-            serve_client(s, |p: &str| {
+            let open = |p: &str| {
                 std::fs::OpenOptions::new()
                     .read(true)
                     .custom_flags(FILE_FLAG_NO_BUFFERING)
                     .open(p)
                     .map_err(|e| Refusal::Failed(e.to_string()))
-            })
+            };
+            serve_client(s, open, test_update)
         });
         let (mut s, _) = Session::start(TcpStream::connect(addr).unwrap()).unwrap();
         s.open(file.to_str().unwrap()).unwrap();
@@ -539,6 +610,62 @@ mod tests {
         assert_eq!(buf, data[4096..8192]);
         drop(s);
         std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn an_update_that_installs_ends_the_session_after_its_reply() {
+        let (addr, ended) =
+            tcp_server_with(|| Ok(Update::Installed(Version::parse("9.8.7").unwrap())));
+        let (mut s, version) = Session::start(TcpStream::connect(addr).unwrap()).unwrap();
+        let (reply, installed) = s.update(&version).unwrap();
+        assert_eq!(reply, "updated to 9.8.7; restarting when idle");
+        assert_eq!(installed, Version::parse("9.8.7"));
+        let mut rest = Vec::new();
+        s.s.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+        let ended = ended
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(ended, Ended::Updated);
+    }
+
+    #[test]
+    fn a_failed_update_is_an_error_and_the_session_goes_on() {
+        let (addr, ended) =
+            tcp_server_with(|| Err(io::Error::other("curl: (6) Could not resolve host")));
+        let (mut s, version) = Session::start(TcpStream::connect(addr).unwrap()).unwrap();
+        let e = s.update(&version).unwrap_err();
+        assert_eq!(e.to_string(), "curl: (6) Could not resolve host");
+        // Still answering: a READ before OPEN gets its own error.
+        let e = s.read_at(&mut [0u8; 10], 0).unwrap_err();
+        assert!(e.to_string().contains("before OPEN"), "{e}");
+        drop(s);
+        let ended = ended
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(ended, Ended::Closed);
+    }
+
+    /// A service from before UPDATE existed, as 0.2.0 answers it.
+    #[test]
+    fn an_old_service_is_told_apart() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            assert_eq!(read_byte(&mut s).unwrap(), Some(PROTOCOL));
+            respond(&mut s, OK, b"0.2.0").unwrap();
+            let op = read_byte(&mut s).unwrap().unwrap();
+            let msg = format!("unknown operation {op}");
+            respond(&mut s, ERROR, msg.as_bytes()).unwrap();
+        });
+        let (mut s, version) = Session::start(TcpStream::connect(addr).unwrap()).unwrap();
+        assert_eq!(version, "0.2.0");
+        let e = s.update(&version).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "this helper (0.2.0) predates self-update; run `btrfs-peek helper install` from an elevated terminal once more"
+        );
     }
 
     #[test]

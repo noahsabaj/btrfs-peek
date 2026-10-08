@@ -1,7 +1,10 @@
 //! The Windows side of the helper: install and uninstall, the service and its
-//! pipe, and the client that `Device::open` falls back to.
+//! pipe, and the client that `Device::open` falls back to. The service's
+//! self-update is in `updater.rs`.
 
-use super::{open_partition, serve_client, sid_ok, Action, Refusal, Session};
+mod updater;
+
+use super::{open_partition, serve_client, sid_ok, Action, Ended, Refusal, Session, Update};
 use anyhow::{bail, Context, Result};
 use std::convert::Infallible;
 use std::ffi::c_void;
@@ -41,13 +44,16 @@ use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, CloseServiceHandle, ControlService, CreateServiceW, DeleteService,
     OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, RegisterServiceCtrlHandlerExW,
-    SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW, SC_HANDLE, SC_MANAGER_ALL_ACCESS,
-    SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
-    SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION,
-    SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN,
-    SERVICE_CONTROL_STOP, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS,
-    SERVICE_REQUIRED_PRIVILEGES_INFOW, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_PROCESS,
-    SERVICE_STOP, SERVICE_STOPPED, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+    SetServiceStatus, StartServiceCtrlDispatcherW, StartServiceW, SC_ACTION, SC_ACTION_RESTART,
+    SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO,
+    SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
+    SERVICE_CONFIG_DESCRIPTION, SERVICE_CONFIG_FAILURE_ACTIONS,
+    SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO,
+    SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
+    SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW,
+    SERVICE_FAILURE_ACTIONS_FLAG, SERVICE_QUERY_STATUS, SERVICE_REQUIRED_PRIVILEGES_INFOW,
+    SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOPPED,
+    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -65,6 +71,7 @@ pub fn run(action: &Action, json: bool) -> Result<()> {
         Action::Install { sid } => install(sid.as_deref()),
         Action::Uninstall => uninstall(),
         Action::Status => status(json),
+        Action::Update => update(),
         Action::Serve { sid } => serve(sid),
     }
 }
@@ -362,6 +369,50 @@ fn configure(svc: &Sc, sid: &str) -> Result<()> {
         return Err(io::Error::last_os_error())
             .context("limiting the btrfs-peek service's privileges");
     }
+    restart_on_failure(svc)
+}
+
+/// The service restarts onto an update by exiting without reporting
+/// SERVICE_STOPPED, which the service manager treats as a failure: these
+/// actions are what start it again. They also restart it after a crash.
+fn restart_on_failure(svc: &Sc) -> Result<()> {
+    let mut actions = [2_000, 10_000, 60_000].map(|ms| SC_ACTION {
+        Type: SC_ACTION_RESTART,
+        Delay: ms,
+    });
+    let failure = SERVICE_FAILURE_ACTIONSW {
+        dwResetPeriod: 24 * 60 * 60, // seconds
+        lpRebootMsg: null_mut(),
+        lpCommand: null_mut(),
+        cActions: actions.len() as u32,
+        lpsaActions: actions.as_mut_ptr(),
+    };
+    let ok = unsafe {
+        ChangeServiceConfig2W(
+            svc.0,
+            SERVICE_CONFIG_FAILURE_ACTIONS,
+            (&failure as *const SERVICE_FAILURE_ACTIONSW).cast(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error())
+            .context("setting the btrfs-peek service's failure actions");
+    }
+    // Also when the service stops itself with an error, not only on a crash.
+    let flag = SERVICE_FAILURE_ACTIONS_FLAG {
+        fFailureActionsOnNonCrashFailures: 1,
+    };
+    let ok = unsafe {
+        ChangeServiceConfig2W(
+            svc.0,
+            SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+            (&flag as *const SERVICE_FAILURE_ACTIONS_FLAG).cast(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error())
+            .context("setting the btrfs-peek service's failure actions");
+    }
     Ok(())
 }
 
@@ -399,7 +450,7 @@ fn install(sid: Option<&str>) -> Result<()> {
         bail!("the service was installed and started but does not answer{why}");
     }
     println!(
-        "installed the btrfs-peek helper {}: the service runs {} and lets {sid} read btrfs partitions",
+        "installed the btrfs-peek helper {}: the service runs {} and lets {sid} read btrfs partitions; it now updates itself from signed releases",
         super::VERSION,
         exe.display()
     );
@@ -437,6 +488,8 @@ struct State {
     running: bool,
     pid: Option<u32>,
     version: Option<String>,
+    /// The service's last update check (`update-status.txt`), if it made one.
+    last_update_check: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Connects and handshakes; the server's version.
@@ -475,17 +528,59 @@ fn check(st: &mut State) -> std::result::Result<(), String> {
 fn status(json: bool) -> Result<()> {
     let mut st = State::default();
     let problem = check(&mut st).err();
+    let last_check = std::fs::read_to_string(install_dir().join(updater::STATUS_FILE)).ok();
+    st.last_update_check = last_check.as_deref().map(updater::parse_status);
     if json {
         println!("{}", serde_json::to_string_pretty(&st)?);
-    } else if problem.is_none() {
-        println!(
-            "the btrfs-peek helper {} is running (pid {}) and answering on {PIPE}",
-            st.version.as_deref().unwrap_or("?"),
-            st.pid.unwrap_or(0)
-        );
+    } else {
+        if problem.is_none() {
+            println!(
+                "the btrfs-peek helper {} is running (pid {}) and answering on {PIPE}",
+                st.version.as_deref().unwrap_or("?"),
+                st.pid.unwrap_or(0)
+            );
+        }
+        if let Some(text) = &last_check {
+            println!("last update check:");
+            for line in text.lines() {
+                println!("  {line}");
+            }
+        }
     }
     if let Some(p) = problem {
         bail!(p);
+    }
+    Ok(())
+}
+
+/// How long `helper update` waits for the service to come back on a new build.
+const RESTART_WAIT: Duration = Duration::from_secs(120);
+
+/// Asks the service to update itself now, unelevated.
+fn update() -> Result<()> {
+    let Some(pipe) = connect_to(PIPE, true).context("connecting to the helper")? else {
+        bail!("the helper is not installed; install it once from an elevated (Administrator) terminal: `btrfs-peek helper install`");
+    };
+    let (mut s, version) = Session::start(pipe).context("connecting to the helper")?;
+    eprintln!("asking the btrfs-peek helper {version} to check for a signed release...");
+    let (reply, installed) = s.update(&version)?;
+    drop(s);
+    println!("{reply}");
+    let Some(new) = installed else {
+        return Ok(());
+    };
+    let new = new.to_string();
+    let back = wait_until(RESTART_WAIT, || {
+        let up = probe().is_ok_and(|v| v == new);
+        if !up {
+            std::thread::sleep(Duration::from_millis(900));
+        }
+        up
+    });
+    if back {
+        println!("the btrfs-peek helper {new} is running");
+    } else {
+        println!("the helper has not come back on {new} yet: it restarts once no client is reading through it (within an hour); `btrfs-peek helper status` shows which version answers");
     }
     Ok(())
 }
@@ -547,8 +642,10 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     }
     STATUS.store(h, Ordering::SeqCst);
     report(SERVICE_RUNNING, NO_ERROR);
+    updater::clean_up();
+    updater::spawn_checks();
     let sid = SID.get().map_or("", String::as_str);
-    let Err(e) = listen(PIPE, sid, open_partition);
+    let Err(e) = listen(PIPE, sid, SERVICE_HANDLERS);
     report(SERVICE_STOPPED, e.raw_os_error().map_or(1, |c| c as u32));
 }
 
@@ -636,26 +733,36 @@ impl PipeServer {
     }
 }
 
-/// Serves `name` until something fails: one thread per client, `open`
-/// deciding what each may read. Only `sid` (and SYSTEM) may connect.
-pub fn listen(
-    name: &str,
-    sid: &str,
-    open: fn(&str) -> std::result::Result<File, Refusal>,
-) -> io::Result<Infallible> {
+/// What the pipe's sessions do; tests swap in their own.
+#[derive(Clone, Copy)]
+pub struct Handlers {
+    /// Decides what a client may read.
+    pub open: fn(&str) -> std::result::Result<File, Refusal>,
+    /// What UPDATE runs.
+    pub update: fn() -> io::Result<Update>,
+    /// Runs after a session whose UPDATE installed a build has ended.
+    pub updated: fn(),
+}
+
+const SERVICE_HANDLERS: Handlers = Handlers {
+    open: open_partition,
+    update: updater::check_and_record,
+    updated: updater::restart_when_idle,
+};
+
+/// Serves `name` until something fails, one thread per client. Only `sid`
+/// (and SYSTEM) may connect.
+pub fn listen(name: &str, sid: &str, handlers: Handlers) -> io::Result<Infallible> {
     if !sid_ok(sid) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{sid}: not a SID"),
         ));
     }
-    serve_pipe(&PipeServer::new(name, &pipe_sddl(sid))?, open)
+    serve_pipe(&PipeServer::new(name, &pipe_sddl(sid))?, handlers)
 }
 
-fn serve_pipe(
-    server: &PipeServer,
-    open: fn(&str) -> std::result::Result<File, Refusal>,
-) -> io::Result<Infallible> {
+fn serve_pipe(server: &PipeServer, h: Handlers) -> io::Result<Infallible> {
     let mut next = server.create(true)?;
     loop {
         let pipe = next;
@@ -674,7 +781,18 @@ fn serve_pipe(
         next = server.create(false)?;
         match connected {
             Ok(()) => {
-                std::thread::spawn(move || serve_client(pipe, open));
+                std::thread::spawn(move || {
+                    // Counted while it lasts: a restart waits for no session.
+                    let ended = {
+                        let _busy = updater::Busy::enter();
+                        serve_client(pipe, h.open, h.update)
+                    };
+                    // The session that asked has its reply and is closed; this
+                    // thread waits for the others, then ends the process.
+                    if let Ok(Ended::Updated) = ended {
+                        (h.updated)();
+                    }
+                });
             }
             // The client left before we saw it.
             Err(e) if is(&e, ERROR_NO_DATA) => {}
@@ -742,7 +860,7 @@ impl Remote {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{exercise, test_open};
+    use super::super::tests::{exercise, test_open, test_update};
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
@@ -765,7 +883,12 @@ mod tests {
             &format!("{CLIENT_ACCESS:#x}"),
             &format!("{:#x}", FILE_GENERIC_READ | FILE_GENERIC_WRITE),
         );
-        serve_pipe(&PipeServer::new(name, &sddl)?, test_open)
+        let handlers = Handlers {
+            open: test_open,
+            update: test_update,
+            updated: || {},
+        };
+        serve_pipe(&PipeServer::new(name, &sddl)?, handlers)
     }
 
     fn spawn_test_server() -> (String, String) {
@@ -785,6 +908,42 @@ mod tests {
                 None => panic!("{name} never appeared"),
             }
         }
+    }
+
+    /// An UPDATE that installs: the client gets its reply, the session ends,
+    /// and only then does the restart hook run.
+    #[test]
+    fn an_installed_update_runs_the_restart_hook_after_the_session() {
+        static RESTARTED: AtomicUsize = AtomicUsize::new(0);
+        let name = unique_pipe();
+        let sid = current_user_sid().unwrap();
+        let sddl = pipe_sddl(&sid).replace(
+            &format!("{CLIENT_ACCESS:#x}"),
+            &format!("{:#x}", FILE_GENERIC_READ | FILE_GENERIC_WRITE),
+        );
+        let handlers = Handlers {
+            open: test_open,
+            update: || {
+                Ok(Update::Installed(
+                    super::super::Version::parse("9.9.9").unwrap(),
+                ))
+            },
+            updated: || {
+                RESTARTED.fetch_add(1, Ordering::SeqCst);
+            },
+        };
+        let n = name.clone();
+        std::thread::spawn(move || serve_pipe(&PipeServer::new(&n, &sddl)?, handlers));
+        let (mut s, version) = Session::start(connect(&name)).unwrap();
+        assert_eq!(RESTARTED.load(Ordering::SeqCst), 0);
+        let (reply, installed) = s.update(&version).unwrap();
+        assert_eq!(reply, "updated to 9.9.9; restarting when idle");
+        assert_eq!(installed.unwrap().to_string(), "9.9.9");
+        assert!(
+            wait_until(Duration::from_secs(10), || RESTARTED.load(Ordering::SeqCst)
+                == 1),
+            "the restart hook never ran"
+        );
     }
 
     #[test]

@@ -3,3 +3,4 @@
 * text=auto eol=lf
 *.png binary
 *.img binary
+tests/fixtures/update/payload.bin binary
